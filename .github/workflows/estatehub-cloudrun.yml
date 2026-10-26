@@ -1,0 +1,170 @@
+name: EstateHub en Cloud Run (workflow reutilizable del curso)
+
+# Fuente: curso1-backend-fastapi/infra/awa-workflows/ del repo docente. Se publica tal cual en el
+# repositorio público ykro/awa-workflows con la etiqueta v1, y lo llama el deploy.yml de cada repo
+# de la U3 (`uses: ykro/awa-workflows/.github/workflows/estatehub-cloudrun.yml@v1`).
+#
+# Por qué vive fuera del repo del alumno (contrato v2, STANDARDS.md §10.6): el proveedor de WIF del
+# proyecto del curso solo emite credenciales cuando el token OIDC trae
+#   job_workflow_ref == ykro/awa-workflows/.github/workflows/estatehub-cloudrun.yml@refs/tags/v1
+# Ese claim lo fija GitHub y apunta a ESTE archivo, que el alumno no puede editar. Si alguien cambia
+# su deploy.yml en main para correr otros comandos (por ejemplo subir --min-instances o pedir GPU),
+# su job no recibe credenciales. Los flags de costo de abajo son, por lo tanto, los únicos posibles.
+#
+# Reglas de este archivo:
+#   - Ningún código del alumno corre después de autenticarse: la imagen se construye ANTES del
+#     paso de WIF (un RUN del Dockerfile no puede leer el archivo de credenciales).
+#   - Sin entradas que cambien flags de Cloud Run; solo las 4 variables de ubicación.
+#   - Cambiarlo exige publicar una etiqueta nueva y actualizar la condición del proveedor de WIF
+#     (infra/setup-classroom-wif.sh, DEPLOY_WORKFLOW_REF).
+
+on:
+  workflow_call:
+    inputs:
+      gcp_project_id:
+        type: string
+        required: true
+      gcp_region:
+        type: string
+        required: true
+      gcp_wif_provider:
+        type: string
+        required: true
+      gcp_ar_repo:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation: credenciales temporales, sin llaves JSON
+    env:
+      GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+      GCP_REGION: ${{ inputs.gcp_region }}
+      GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+      GCP_AR_REPO: ${{ inputs.gcp_ar_repo }}
+    steps:
+      - name: Verificar variables de despliegue
+        run: |
+          missing=""
+          for name in GCP_PROJECT_ID GCP_REGION GCP_WIF_PROVIDER GCP_AR_REPO; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Faltan variables de despliegue::No están definidas:$missing. Defínelas en la organización del curso o en tu repositorio (guía de despliegue del material de la unidad)."
+            exit 1
+          fi
+
+      - name: Calcular nombres derivados del repositorio
+        id: names
+        run: |
+          full=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          h=$(printf '%s' "$full" | sha256sum | cut -c1-64)
+          slug=$(printf '%s' "${full#*/}" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//')
+          service="estatehub-${slug}-${h:0:8}"
+          label=$(printf '%s' "${full#*/}" | sed -E 's/[^a-z0-9_-]+/-/g' | cut -c1-63)
+          {
+            echo "owner=$full"
+            echo "service=$service"
+            echo "label=$label"
+            echo "deployer=ehd-${h:0:20}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+            echo "runtime=ehr-${h:0:20}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+            echo "secret=estatehub-jwt-${h:0:20}"
+            echo "image=${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GCP_AR_REPO}/${service}:${GITHUB_SHA}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Servicio: $service"
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Construir la imagen (antes de autenticarse)
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+        run: docker build -t "$IMAGE" .
+
+      - name: Autenticar con Workload Identity Federation
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ inputs.gcp_wif_provider }}
+          service_account: ${{ steps.names.outputs.deployer }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Subir la imagen a Artifact Registry
+        id: image
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+        run: |
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          docker push "$IMAGE"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Imagen: $digest"
+
+      - name: Desplegar en Cloud Run (por digest)
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v3
+        with:
+          service: ${{ steps.names.outputs.service }}
+          image: ${{ steps.image.outputs.digest }}
+          region: ${{ inputs.gcp_region }}
+          project_id: ${{ inputs.gcp_project_id }}
+          env_vars: |
+            OWNER=${{ steps.names.outputs.owner }}
+            COMMIT_SHA=${{ github.sha }}
+            JWT_AUDIENCE=${{ steps.names.outputs.service }}
+          secrets: |
+            JWT_SECRET_KEY=${{ steps.names.outputs.secret }}:latest
+          labels: |
+            awa-repo=${{ steps.names.outputs.label }}
+          flags: >-
+            --max-instances=1
+            --min-instances=0
+            --cpu=1
+            --memory=512Mi
+            --cpu-throttling
+            --allow-unauthenticated
+            --service-account=${{ steps.names.outputs.runtime }}
+
+      - name: Comprobar /health (owner y commit) y publicar la URL
+        env:
+          SERVICE: ${{ steps.names.outputs.service }}
+          OWNER: ${{ steps.names.outputs.owner }}
+          FALLBACK_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          urls=$(gcloud run services describe "$SERVICE" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --format='value(metadata.annotations."run.googleapis.com/urls")' || true)
+          url=$(printf '%s' "$urls" | grep -oE "https://${SERVICE}-[0-9]+\.${GCP_REGION}\.run\.app" | head -n1 || true)
+          if [ -z "$url" ]; then url="$FALLBACK_URL"; fi
+          echo "URL: $url"
+          health=$(curl --fail --silent --show-error "$url/health")
+          echo "$health"
+          HEALTH="$health" python3 - <<'PY'
+          import json, os, sys
+          body = json.loads(os.environ["HEALTH"])
+          problems = []
+          if body.get("owner") != os.environ["OWNER"]:
+              problems.append(f"owner={body.get('owner')!r} (se esperaba {os.environ['OWNER']!r})")
+          if body.get("commit") != os.environ["GITHUB_SHA"]:
+              problems.append(f"commit={body.get('commit')!r} (se esperaba {os.environ['GITHUB_SHA']!r})")
+          if problems:
+              print("::error title=/health no coincide con el despliegue::" + "; ".join(problems))
+              sys.exit(1)
+          PY
+          {
+            echo "### Despliegue"
+            echo ""
+            echo "URL: $url"
+            echo ""
+            echo "Commit desplegado: $GITHUB_SHA"
+            echo ""
+            echo "Copia exactamente esta URL en DEPLOYMENT.md. En el proyecto del curso, el calificador solo"
+            echo "acepta la URL con el número de proyecto: https://${SERVICE}-<número>.${GCP_REGION}.run.app"
+          } >> "$GITHUB_STEP_SUMMARY"
